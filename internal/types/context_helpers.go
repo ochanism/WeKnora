@@ -47,7 +47,7 @@ func SessionTenantIDFromContext(ctx context.Context) (uint64, bool) {
 }
 
 // LanguageFromContext extracts the language locale string from ctx (e.g. "zh-CN", "en-US").
-// Returns ("zh-CN", false) when the key is absent.
+// Returns ("", false) when the key is absent.
 func LanguageFromContext(ctx context.Context) (string, bool) {
 	v, ok := ctx.Value(LanguageContextKey).(string)
 	return v, ok && v != ""
@@ -87,7 +87,7 @@ func LanguageLocaleName(locale string) string {
 	case "pt-BR", "pt":
 		return "Portuguese"
 	default:
-		// For unknown locales, return the locale itself
-		return locale
+		// Unknown locale — fall back to Chinese (Simplified) to match the project's default language
+		return "Chinese (Simplified)"
 	}
 }
