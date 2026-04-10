@@ -18,6 +18,7 @@ const (
 	ModelTypeRerank      ModelType = "Rerank"      // Rerank model
 	ModelTypeKnowledgeQA ModelType = "KnowledgeQA" // KnowledgeQA model
 	ModelTypeVLLM        ModelType = "VLLM"        // VLLM model
+	ModelTypeASR         ModelType = "ASR"         // ASR (Automatic Speech Recognition) model
 )
 
 // ModelStatus represents the status of the model
@@ -49,6 +50,7 @@ const (
 	ModelSourceOpenRouter  ModelSource = "openrouter"  // OpenRouter model
 	ModelSourceNvidia      ModelSource = "nvidia"      // NVIDIA model
 	ModelSourceNovita      ModelSource = "novita"      // Novita AI model
+	ModelSourceAzureOpenAI ModelSource = "azure_openai" // Azure OpenAI model
 )
 
 // EmbeddingParameters represents the embedding parameters for a model

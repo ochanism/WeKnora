@@ -8,6 +8,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
+	"github.com/Tencent/WeKnora/internal/models/asr"
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	"github.com/Tencent/WeKnora/internal/models/vlm"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -255,6 +256,7 @@ func (s *modelService) GetEmbeddingModel(ctx context.Context, modelId string) (e
 		Dimensions:           model.Parameters.EmbeddingParameters.Dimension,
 		TruncatePromptTokens: model.Parameters.EmbeddingParameters.TruncatePromptTokens,
 		Provider:             model.Parameters.Provider,
+		Extra:                stringMapToAnyMap(model.Parameters.ExtraConfig),
 	}, s.pooler, s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
@@ -310,6 +312,7 @@ func (s *modelService) GetEmbeddingModelForTenant(ctx context.Context, modelId s
 		Dimensions:           model.Parameters.EmbeddingParameters.Dimension,
 		TruncatePromptTokens: model.Parameters.EmbeddingParameters.TruncatePromptTokens,
 		Provider:             model.Parameters.Provider,
+		Extra:                stringMapToAnyMap(model.Parameters.ExtraConfig),
 	}, s.pooler, s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
@@ -393,6 +396,8 @@ func (s *modelService) GetChatModel(ctx context.Context, modelId string) (chat.C
 		BaseURL:   model.Parameters.BaseURL,
 		ModelName: model.Name,
 		Source:    model.Source,
+		Provider:  model.Parameters.Provider,
+		Extra:     stringMapToAnyMap(model.Parameters.ExtraConfig),
 	}, s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
@@ -444,6 +449,8 @@ func (s *modelService) GetVLMModel(ctx context.Context, modelId string) (vlm.VLM
 		ModelName:     model.Name,
 		Source:        model.Source,
 		InterfaceType: ifType,
+		Provider:      model.Parameters.Provider,
+		Extra:         stringMapToAnyMap(model.Parameters.ExtraConfig),
 	}, s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
@@ -458,3 +465,55 @@ func (s *modelService) GetVLMModel(ctx context.Context, modelId string) (vlm.VLM
 
 // Note: default model selection logic has been removed; models no longer
 // maintain a per-type default flag at the service layer.
+
+// GetASRModel retrieves and initializes an automatic speech recognition model instance.
+func (s *modelService) GetASRModel(ctx context.Context, modelId string) (asr.ASR, error) {
+	if modelId == "" {
+		return nil, errors.New("model ID cannot be empty")
+	}
+
+	tenantID := types.MustTenantIDFromContext(ctx)
+
+	model, err := s.repo.GetByID(ctx, tenantID, modelId)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"model_id":  modelId,
+			"tenant_id": tenantID,
+		})
+		return nil, err
+	}
+
+	if model == nil {
+		return nil, ErrModelNotFound
+	}
+
+	logger.Infof(ctx, "Getting ASR model: %s, source: %s", model.Name, model.Source)
+
+	sttModel, err := asr.NewASR(&asr.Config{
+		ModelID:   model.ID,
+		APIKey:    model.Parameters.APIKey,
+		BaseURL:   model.Parameters.BaseURL,
+		ModelName: model.Name,
+		Source:    model.Source,
+	})
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"model_id":   model.ID,
+			"model_name": model.Name,
+		})
+		return nil, err
+	}
+
+	return sttModel, nil
+}
+
+func stringMapToAnyMap(m map[string]string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	result := make(map[string]any, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}

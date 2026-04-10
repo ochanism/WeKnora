@@ -47,11 +47,11 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/service/llmcontext"
 	memoryService "github.com/Tencent/WeKnora/internal/application/service/memory"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
-	infra_web_search "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/datasource"
 	feishuConnector "github.com/Tencent/WeKnora/internal/datasource/connector/feishu"
+	notionConnector "github.com/Tencent/WeKnora/internal/datasource/connector/notion"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/handler/session"
@@ -63,6 +63,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/im/telegram"
 	"github.com/Tencent/WeKnora/internal/im/wecom"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
+	infra_web_search "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/mcp"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
@@ -172,6 +173,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewChunkExtractService, dig.Name("chunkExtractor")))
 	must(container.Provide(service.NewDataTableSummaryService, dig.Name("dataTableSummary")))
 	must(container.Provide(service.NewImageMultimodalService, dig.Name("imageMultimodal")))
+	must(container.Provide(service.NewVideoMultimodalService, dig.Name("videoMultimodal")))
 
 	must(container.Provide(service.NewMessageService))
 	must(container.Provide(service.NewMCPServiceService))
@@ -963,6 +965,7 @@ func registerWebSearchProviders(registry *infra_web_search.Registry) {
 	registry.Register("google", infra_web_search.NewGoogleProvider)
 	registry.Register("bing", infra_web_search.NewBingProvider)
 	registry.Register("tavily", infra_web_search.NewTavilyProvider)
+	registry.Register("ollama", infra_web_search.NewOllamaProvider)
 }
 
 // registerIMAdapterFactories registers adapter factories for each IM platform
@@ -1009,6 +1012,7 @@ func registerIMAdapterFactories(imService *imPkg.Service) {
 			client := wecom.NewLongConnClient(
 				getString(creds, "bot_id"),
 				getString(creds, "bot_secret"),
+				getString(creds, "bot_name"),
 				msgHandler,
 			)
 
@@ -1276,8 +1280,10 @@ func initConnectorRegistry() *datasource.ConnectorRegistry {
 	// Register Feishu connector
 	_ = registry.Register(feishuConnector.NewConnector())
 
+	// Register Notion connector
+	_ = registry.Register(notionConnector.NewConnector())
+
 	// Future connectors will be registered here:
-	// _ = registry.Register(notionConnector.NewConnector())
 	// _ = registry.Register(confluenceConnector.NewConnector())
 	// _ = registry.Register(yuqueConnector.NewConnector())
 	// _ = registry.Register(githubConnector.NewConnector())

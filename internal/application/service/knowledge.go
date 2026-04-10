@@ -259,6 +259,15 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		logger.Info(ctx, "Image multimodal configuration validation passed")
 	}
 
+	// 检查音频ASR配置完整性 - 只在音频文件时校验
+	if IsAudioType(getFileType(fileName)) {
+		if !kb.ASRConfig.IsASREnabled() {
+			logger.Error(ctx, "ASR model is not configured")
+			return nil, werrors.NewBadRequestError("上传音频文件需要设置ASR语音识别模型")
+		}
+		logger.Info(ctx, "Audio ASR configuration validation passed")
+	}
+
 	// Validate file type
 	logger.Infof(ctx, "Checking file type: %s", fileName)
 	if !isValidFileType(fileName) {
@@ -383,6 +392,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		}
 	}
 
+	lang, _ := types.LanguageFromContext(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -393,6 +403,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
+		Language:                 lang,
 	}
 
 	payloadBytes, err := json.Marshal(taskPayload)
@@ -557,6 +568,7 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		}
 	}
 
+	lang, _ := types.LanguageFromContext(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -565,6 +577,7 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
+		Language:                 lang,
 	}
 
 	payloadBytes, err := json.Marshal(taskPayload)
@@ -592,6 +605,11 @@ var allowedFileURLExtensions = map[string]bool{
 	"pdf":  true,
 	"docx": true,
 	"doc":  true,
+	"mp3":  true,
+	"wav":  true,
+	"m4a":  true,
+	"flac": true,
+	"ogg":  true,
 }
 
 // maxFileURLSize is the maximum allowed file size for file URL import (10MB)
@@ -770,6 +788,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		}
 	}
 
+	lang, _ := types.LanguageFromContext(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -780,6 +799,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
+		Language:                 lang,
 	}
 
 	payloadBytes, err := json.Marshal(taskPayload)
@@ -988,6 +1008,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              knowledge.ID,
@@ -996,6 +1017,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 			EnableMultimodel:         false, // 文本段落不支持多模态
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -1059,6 +1081,46 @@ func (s *knowledgeService) ListPagedKnowledgeByKnowledgeBaseID(ctx context.Conte
 	return types.NewPageResult(total, page, knowledges), nil
 }
 
+// collectImageURLs extracts unique provider:// image URLs from image_info JSON strings.
+func collectImageURLs(ctx context.Context, imageInfos []string) []string {
+	seen := make(map[string]struct{})
+	var urls []string
+	for _, info := range imageInfos {
+		if info == "" {
+			continue
+		}
+		var images []*types.ImageInfo
+		if err := json.Unmarshal([]byte(info), &images); err != nil {
+			logger.Warnf(ctx, "Failed to parse image_info JSON: %v", err)
+			continue
+		}
+		for _, img := range images {
+			if img.URL != "" {
+				if _, exists := seen[img.URL]; !exists {
+					seen[img.URL] = struct{}{}
+					urls = append(urls, img.URL)
+				}
+			}
+		}
+	}
+	return urls
+}
+
+// deleteExtractedImages deletes all extracted image files from storage.
+// Standalone function — callable from both knowledgeService and knowledgeBaseService.
+// Errors are logged but do not fail the overall deletion.
+func deleteExtractedImages(ctx context.Context, fileSvc interfaces.FileService, imageURLs []string) {
+	if len(imageURLs) == 0 {
+		return
+	}
+	logger.Infof(ctx, "Deleting %d extracted images", len(imageURLs))
+	for _, url := range imageURLs {
+		if err := fileSvc.DeleteFile(ctx, url); err != nil {
+			logger.Errorf(ctx, "Failed to delete extracted image %s: %v", url, err)
+		}
+	}
+}
+
 // DeleteKnowledge deletes a knowledge entry and all related resources
 func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error {
 	// Get the knowledge entry
@@ -1082,6 +1144,18 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 	// Resolve file service for this KB before spawning goroutines
 	kb, _ := s.kbService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
 	kbFileSvc := s.resolveFileService(ctx, kb)
+
+	// Collect image URLs before chunks are deleted (ImageInfo references are lost after deletion)
+	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	chunkImageInfos, err := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantID, []string{id})
+	if err != nil {
+		logger.Errorf(ctx, "Failed to collect image URLs for cleanup: %v", err)
+	}
+	var imageInfoStrs []string
+	for _, ci := range chunkImageInfos {
+		imageInfoStrs = append(imageInfoStrs, ci.ImageInfo)
+	}
+	imageURLs := collectImageURLs(ctx, imageInfoStrs)
 
 	wg := errgroup.Group{}
 	// Delete knowledge embeddings from vector store
@@ -1116,13 +1190,14 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 		return nil
 	})
 
-	// Delete the physical file if it exists
+	// Delete the physical file and extracted images if they exist
 	wg.Go(func() error {
 		if knowledge.FilePath != "" {
 			if err := kbFileSvc.DeleteFile(ctx, knowledge.FilePath); err != nil {
 				logger.GetLogger(ctx).WithField("error", err).Errorf("DeleteKnowledge delete file failed")
 			}
 		}
+		deleteExtractedImages(ctx, kbFileSvc, imageURLs)
 		tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
 		tenantInfo.StorageUsed -= knowledge.StorageSize
 		if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, -knowledge.StorageSize); err != nil {
@@ -1181,6 +1256,25 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 		}
 	}
 
+	// Collect image URLs before chunks are deleted
+	chunkImageInfos, err := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantInfo.ID, ids)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to collect image URLs for batch cleanup: %v", err)
+	}
+	knowledgeToKB := make(map[string]string)
+	for _, k := range knowledgeList {
+		knowledgeToKB[k.ID] = k.KnowledgeBaseID
+	}
+	kbImageInfos := make(map[string][]string) // kbID → []imageInfo JSON
+	for _, ci := range chunkImageInfos {
+		kbID := knowledgeToKB[ci.KnowledgeID]
+		kbImageInfos[kbID] = append(kbImageInfos[kbID], ci.ImageInfo)
+	}
+	kbImageURLs := make(map[string][]string) // kbID → []imageURL (deduplicated)
+	for kbID, infos := range kbImageInfos {
+		kbImageURLs[kbID] = collectImageURLs(ctx, infos)
+	}
+
 	wg := errgroup.Group{}
 	// 2. Delete knowledge embeddings from vector store
 	wg.Go(func() error {
@@ -1228,7 +1322,7 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 		return nil
 	})
 
-	// 4. Delete the physical file if it exists
+	// 4. Delete the physical file and extracted images if they exist
 	wg.Go(func() error {
 		storageAdjust := int64(0)
 		for _, knowledge := range knowledgeList {
@@ -1239,6 +1333,15 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 				}
 			}
 			storageAdjust -= knowledge.StorageSize
+		}
+		// Delete extracted images per KB
+		for kbID, urls := range kbImageURLs {
+			fSvc := kbFileServices[kbID]
+			if fSvc == nil {
+				logger.Warnf(ctx, "No file service for KB %s, skipping %d image deletions", kbID, len(urls))
+				continue
+			}
+			deleteExtractedImages(ctx, fSvc, urls)
 		}
 		tenantInfo.StorageUsed += storageAdjust
 		if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, storageAdjust); err != nil {
@@ -1376,6 +1479,8 @@ type ProcessChunksOptions struct {
 	QuestionCount            int
 	EnableMultimodel         bool
 	StoredImages             []docparser.StoredImage
+	IsVideo                  bool   // true when knowledge is a standalone video file
+	VideoFilePath            string // storage path to video file (provider:// URL)
 	// ParentChunks holds parent chunk data when parent-child chunking is enabled.
 	// When set, the chunks passed to processChunks are child chunks, and each
 	// child's ParentIndex references an entry in this slice.
@@ -1761,13 +1866,15 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		return
 	}
 
-	// Skip summary/question generation for image-type knowledge — the text chunk
-	// is just a markdown image reference, so LLM summary would be useless.
-	// The multimodal task will provide a caption as the description instead.
+	// Skip summary/question generation for image-type and video-type knowledge — the text chunk
+	// is just a markdown reference, so LLM summary would be useless.
+	// The multimodal task will provide a caption/summary as the description instead.
 	isImage := IsImageType(knowledge.FileType)
-	pendingMultimodal := isImage && options.EnableMultimodel && len(options.StoredImages) > 0
+	isVideo := IsVideoType(knowledge.FileType)
+	pendingMultimodal := (isImage && options.EnableMultimodel && len(options.StoredImages) > 0) ||
+		(isVideo && options.EnableMultimodel && options.IsVideo && options.VideoFilePath != "")
 
-	// For image files with pending multimodal processing, keep "processing" status
+	// For image/video files with pending multimodal processing, keep "processing" status
 	// so the frontend waits until the description is ready before showing "completed".
 	if pendingMultimodal {
 		knowledge.ParseStatus = types.ParseStatusProcessing
@@ -1781,7 +1888,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	knowledge.UpdatedAt = now
 
 	// Set summary status based on whether summary generation will be triggered
-	if len(textChunks) > 0 && !isImage {
+	if len(textChunks) > 0 && !isImage && !isVideo {
 		knowledge.SummaryStatus = types.SummaryStatusPending
 	} else {
 		knowledge.SummaryStatus = types.SummaryStatusNone
@@ -1792,7 +1899,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	}
 
 	// Enqueue question generation task if enabled (async, non-blocking)
-	if options.EnableQuestionGeneration && len(textChunks) > 0 && !isImage {
+	if options.EnableQuestionGeneration && len(textChunks) > 0 && !isImage && !isVideo {
 		questionCount := options.QuestionCount
 		if questionCount <= 0 {
 			questionCount = 3
@@ -1804,13 +1911,18 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	}
 
 	// Enqueue summary generation task (async, non-blocking)
-	if len(textChunks) > 0 && !isImage {
+	if len(textChunks) > 0 && !isImage && !isVideo {
 		s.enqueueSummaryGenerationTask(ctx, knowledge.KnowledgeBaseID, knowledge.ID)
 	}
 
 	// Enqueue multimodal tasks for images (async, non-blocking)
 	if options.EnableMultimodel && len(options.StoredImages) > 0 {
 		s.enqueueImageMultimodalTasks(ctx, knowledge, kb, options.StoredImages, chunks)
+	}
+
+	// Enqueue multimodal tasks for videos (async, non-blocking)
+	if options.EnableMultimodel && options.IsVideo && options.VideoFilePath != "" {
+		s.enqueueVideoMultimodalTasks(ctx, knowledge, kb, options.VideoFilePath, chunks)
 	}
 
 	// Update tenant's storage usage
@@ -1821,13 +1933,22 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	logger.GetLogger(ctx).Infof("processChunks successfully")
 }
 
-// GetSummary generates a summary for knowledge content using an AI model
+// defaultMaxInputChars is the default maximum characters used as input for summary generation.
+const defaultMaxInputChars = 16384
+
+// getSummary generates a summary for knowledge content using an AI model
 func (s *knowledgeService) getSummary(ctx context.Context,
 	summaryModel chat.Chat, knowledge *types.Knowledge, chunks []*types.Chunk,
 ) (string, error) {
 	// Get knowledge info from the first chunk
 	if len(chunks) == 0 {
 		return "", fmt.Errorf("no chunks provided for summary generation")
+	}
+
+	// Determine max input chars from config
+	maxInputChars := defaultMaxInputChars
+	if s.config.Conversation.Summary != nil && s.config.Conversation.Summary.MaxInputChars > 0 {
+		maxInputChars = s.config.Conversation.Summary.MaxInputChars
 	}
 
 	// concat chunk contents
@@ -1841,11 +1962,8 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		return sortedChunks[i].StartAt < sortedChunks[j].StartAt
 	})
 
-	// concat chunk contents and collect image infos
+	// concat ALL chunk contents (no early truncation) and collect image infos
 	for _, chunk := range sortedChunks {
-		if chunk.EndAt > 4096 {
-			break
-		}
 		// Ensure we don't slice beyond the current content length
 		runes := []rune(chunkContents)
 		if chunk.StartAt <= len(runes) {
@@ -1881,9 +1999,11 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		chunkContents = chunkContents + imageAnnotations
 	}
 
-	if len(chunkContents) < 300 {
-		return chunkContents, nil
-	}
+	// Apply length limit: sample long content to fit within maxInputChars
+	chunkContents = sampleLongContent(chunkContents, maxInputChars)
+
+	logger.GetLogger(ctx).Infof("getSummary: content length=%d chars (max=%d) for knowledge %s",
+		len([]rune(chunkContents)), maxInputChars, knowledge.ID)
 
 	// Prepare content with metadata for summary generation
 	contentWithMetadata := chunkContents
@@ -1899,6 +2019,12 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 
 		// Prepend metadata to content
 		contentWithMetadata = metadataIntro + "\nContent:\n" + contentWithMetadata
+	}
+
+	// Determine max output tokens from config
+	maxTokens := 2048
+	if s.config.Conversation.Summary != nil && s.config.Conversation.Summary.MaxCompletionTokens > 0 {
+		maxTokens = s.config.Conversation.Summary.MaxCompletionTokens
 	}
 
 	// Generate summary using AI model
@@ -1917,7 +2043,7 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		},
 	}, &chat.ChatOptions{
 		Temperature: 0.3,
-		MaxTokens:   1024,
+		MaxTokens:   maxTokens,
 		Thinking:    &thinking,
 	})
 	if err != nil {
@@ -1926,6 +2052,51 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 	}
 	logger.GetLogger(ctx).WithField("summary", summary.Content).Infof("GetSummary success")
 	return summary.Content, nil
+}
+
+// sampleLongContent returns content that fits within maxChars.
+// For short content (≤ maxChars), it is returned as-is.
+// For long content, it samples: head (60%), tail (20%), and evenly-spaced middle (20%),
+// joined by "[...content omitted...]" markers so the LLM knows content was skipped.
+func sampleLongContent(content string, maxChars int) string {
+	runes := []rune(content)
+	if len(runes) <= maxChars {
+		return content
+	}
+
+	const omitMarker = "\n\n[...content omitted...]\n\n"
+	omitRunes := len([]rune(omitMarker))
+
+	// Reserve space for two omit markers (head→middle, middle→tail)
+	usable := maxChars - 2*omitRunes
+	if usable < 100 {
+		// Fallback: just truncate
+		return string(runes[:maxChars])
+	}
+
+	headLen := usable * 60 / 100
+	tailLen := usable * 20 / 100
+	midLen := usable - headLen - tailLen
+
+	head := string(runes[:headLen])
+	tail := string(runes[len(runes)-tailLen:])
+
+	// Sample middle portion: take a contiguous block from the center of the document
+	midStart := len(runes)/2 - midLen/2
+	if midStart < headLen {
+		midStart = headLen
+	}
+	midEnd := midStart + midLen
+	if midEnd > len(runes)-tailLen {
+		midEnd = len(runes) - tailLen
+		midStart = midEnd - midLen
+		if midStart < headLen {
+			midStart = headLen
+		}
+	}
+	middle := string(runes[midStart:midEnd])
+
+	return head + omitMarker + middle + omitMarker + tail
 }
 
 // enqueueQuestionGenerationTask enqueues an async task for question generation
@@ -2369,14 +2540,14 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 	// Build context section
 	var contextSection string
 	if prevContent != "" || nextContent != "" {
-		contextSection = "## Context Information (for reference only, to help understand the main content)\n"
+		contextSection = "<surrounding_context>\n"
 		if prevContent != "" {
-			contextSection += fmt.Sprintf("[Preceding Context] %s\n", prevContent)
+			contextSection += fmt.Sprintf("[Preceding Content]\n%s\n\n", prevContent)
 		}
 		if nextContent != "" {
-			contextSection += fmt.Sprintf("[Following Context] %s\n", nextContent)
+			contextSection += fmt.Sprintf("[Following Content]\n%s\n\n", nextContent)
 		}
-		contextSection += "\n"
+		contextSection += "</surrounding_context>\n\n"
 	}
 
 	langName := types.LanguageNameFromContext(ctx)
@@ -2704,6 +2875,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2714,6 +2886,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -2754,6 +2927,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2764,6 +2938,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -2799,6 +2974,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2807,6 +2983,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -2833,7 +3010,9 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 // isValidFileType checks if a file type is supported
 func isValidFileType(filename string) bool {
 	switch strings.ToLower(getFileType(filename)) {
-	case "pdf", "txt", "docx", "doc", "md", "markdown", "png", "jpg", "jpeg", "gif", "csv", "xlsx", "xls", "pptx", "ppt", "json":
+	case "pdf", "txt", "docx", "doc", "md", "markdown", "png", "jpg", "jpeg", "gif", "csv", "xlsx", "xls", "pptx", "ppt", "json",
+		"mp3", "wav", "m4a", "flac", "ogg",
+		"mp4", "mov", "avi", "mkv", "webm", "wmv", "flv":
 		return true
 	default:
 		return false
@@ -5269,7 +5448,9 @@ func (s *knowledgeService) UpdateKnowledgeTag(ctx context.Context, knowledgeID s
 }
 
 // UpdateKnowledgeTagBatch updates tags for document knowledge items in batch.
-func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, updates map[string]*string) error {
+// authorizedKBID restricts all updates to knowledge items belonging to this KB;
+// pass empty string to skip the check (caller must ensure authorization by other means).
+func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, authorizedKBID string, updates map[string]*string) error {
 	if len(updates) == 0 {
 		return nil
 	}
@@ -5290,6 +5471,19 @@ func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, updates 
 	knowledgeList, err := s.repo.GetKnowledgeBatch(ctx, tenantID, knowledgeIDs)
 	if err != nil {
 		return err
+	}
+
+	// Validate all requested IDs were found and belong to the authorized KB
+	if authorizedKBID != "" {
+		if len(knowledgeList) != len(updates) {
+			return werrors.NewForbiddenError("some knowledge IDs are not accessible in the authorized scope")
+		}
+		for _, k := range knowledgeList {
+			if k.KnowledgeBaseID != authorizedKBID {
+				return werrors.NewForbiddenError(
+					fmt.Sprintf("knowledge %s does not belong to authorized knowledge base", k.ID))
+			}
+		}
 	}
 
 	// Build tag ID map for validation
@@ -6995,10 +7189,27 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 		}
 	}
 
+	// Collect image URLs before chunks are deleted
+	kb, _ := s.kbService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
+	fileSvc := s.resolveFileService(ctx, kb)
+	chunkImageInfos, imgErr := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantInfo.ID, []string{knowledge.ID})
+	if imgErr != nil {
+		logger.GetLogger(ctx).WithField("error", imgErr).Error("Failed to collect image URLs for cleanup")
+		cleanupErr = errors.Join(cleanupErr, imgErr)
+	}
+	var imageInfoStrs []string
+	for _, ci := range chunkImageInfos {
+		imageInfoStrs = append(imageInfoStrs, ci.ImageInfo)
+	}
+	imageURLs := collectImageURLs(ctx, imageInfoStrs)
+
 	if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Error("Failed to delete manual knowledge chunks")
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
+
+	// Delete extracted images after chunks are deleted
+	deleteExtractedImages(ctx, fileSvc, imageURLs)
 
 	namespace := types.NameSpace{KnowledgeBase: knowledge.KnowledgeBaseID, Knowledge: knowledge.ID}
 	if err := s.graphEngine.DelGraph(ctx, []types.NameSpace{namespace}); err != nil {
@@ -7213,6 +7424,26 @@ func IsImageType(fileType string) bool {
 	}
 }
 
+// IsAudioType checks if a file type is an audio format
+func IsAudioType(fileType string) bool {
+	switch strings.ToLower(fileType) {
+	case "mp3", "wav", "m4a", "flac", "ogg":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsVideoType checks if a file type is a video format
+func IsVideoType(fileType string) bool {
+	switch strings.ToLower(fileType) {
+	case "mp4", "mov", "avi", "mkv", "webm", "wmv", "flv":
+		return true
+	default:
+		return false
+	}
+}
+
 // downloadFileFromURL downloads a remote file to a temp file and returns its binary content.
 // payloadFileName and payloadFileType are in/out pointers: if they point to an empty string,
 // the function resolves the value from Content-Disposition / URL path and writes it back.
@@ -7365,6 +7596,9 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 	ctx = logger.WithRequestID(ctx, payload.RequestId)
 	ctx = logger.WithField(ctx, "document_process", payload.KnowledgeID)
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
+	if payload.Language != "" {
+		ctx = context.WithValue(ctx, types.LanguageContextKey, payload.Language)
+	}
 
 	// 获取任务重试信息，用于判断是否是最后一次重试
 	retryCount, _ := asynq.GetRetryCount(ctx)
@@ -7447,6 +7681,17 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 			WithField("error", ErrImageNotParse).Errorf("processDocument image without enable multimodel")
 		knowledge.ParseStatus = "failed"
 		knowledge.ErrorMessage = ErrImageNotParse.Error()
+		knowledge.UpdatedAt = time.Now()
+		s.repo.UpdateKnowledge(ctx, knowledge)
+		return nil
+	}
+
+	// 检查音频ASR配置（仅对文件导入）
+	if payload.FilePath != "" && IsAudioType(payload.FileType) && !kb.ASRConfig.IsASREnabled() {
+		logger.GetLogger(ctx).WithField("knowledge_id", knowledge.ID).
+			Errorf("processDocument audio without ASR model configured")
+		knowledge.ParseStatus = "failed"
+		knowledge.ErrorMessage = "上传音频文件需要设置ASR语音识别模型"
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		return nil
@@ -7575,8 +7820,57 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		}
 	}
 
+	// Step 1.5: ASR transcription for audio files
+	if convertResult != nil && convertResult.IsAudio && len(convertResult.AudioData) > 0 {
+		if !kb.ASRConfig.IsASREnabled() {
+			logger.Error(ctx, "Audio file detected but ASR is not configured")
+			knowledge.ParseStatus = "failed"
+			knowledge.ErrorMessage = "ASR model is not configured for audio transcription"
+			knowledge.UpdatedAt = time.Now()
+			s.repo.UpdateKnowledge(ctx, knowledge)
+			return nil
+		}
+
+		logger.Infof(ctx, "[ASR] Starting audio transcription for knowledge %s, audio size=%d bytes",
+			knowledge.ID, len(convertResult.AudioData))
+
+		asrModel, err := s.modelService.GetASRModel(ctx, kb.ASRConfig.ModelID)
+		if err != nil {
+			logger.Errorf(ctx, "[ASR] Failed to get ASR model: %v", err)
+			knowledge.ParseStatus = "failed"
+			knowledge.ErrorMessage = fmt.Sprintf("failed to get ASR model: %v", err)
+			knowledge.UpdatedAt = time.Now()
+			s.repo.UpdateKnowledge(ctx, knowledge)
+			return nil
+		}
+
+		transcribedText, err := asrModel.Transcribe(ctx, convertResult.AudioData, knowledge.FileName)
+		if err != nil {
+			logger.Errorf(ctx, "[ASR] Transcription failed: %v", err)
+			if isLastRetry {
+				knowledge.ParseStatus = "failed"
+				knowledge.ErrorMessage = fmt.Sprintf("audio transcription failed: %v", err)
+				knowledge.UpdatedAt = time.Now()
+				s.repo.UpdateKnowledge(ctx, knowledge)
+			}
+			return fmt.Errorf("audio transcription failed: %w", err)
+		}
+
+		if transcribedText == "" {
+			logger.Warn(ctx, "[ASR] Transcription returned empty text")
+			transcribedText = "[No speech detected in audio file]"
+		}
+
+		logger.Infof(ctx, "[ASR] Transcription completed, text length=%d", len(transcribedText))
+		// Replace the audio placeholder with the transcribed text
+		convertResult.MarkdownContent = transcribedText
+		convertResult.IsAudio = false
+		convertResult.AudioData = nil
+	}
+
 	// Step 2: Store images and update markdown references
 	var storedImages []docparser.StoredImage
+
 	if s.imageResolver != nil && convertResult != nil {
 		fileSvc := s.resolveFileService(ctx, kb)
 		tenantID, _ := ctx.Value(types.TenantIDContextKey).(uint64)
@@ -7625,6 +7919,8 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		QuestionCount:            payload.QuestionCount,
 		EnableMultimodel:         payload.EnableMultimodel,
 		StoredImages:             storedImages,
+		IsVideo:                  convertResult != nil && convertResult.IsVideo,
+		VideoFilePath:            payload.FilePath,
 	}
 
 	if kb.ChunkingConfig.EnableParentChild {
@@ -7810,6 +8106,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			chunkID = chunks[0].ChunkID
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		payload := types.ImageMultimodalPayload{
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
@@ -7818,6 +8115,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			ImageURL:        img.ServingURL,
 			EnableOCR:       true,
 			EnableCaption:   true,
+			Language:        lang,
 		}
 
 		payloadBytes, err := json.Marshal(payload)
@@ -7832,6 +8130,50 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 		} else {
 			logger.Infof(ctx, "Enqueued image:multimodal task for %s", img.ServingURL)
 		}
+	}
+}
+
+// enqueueVideoMultimodalTasks enqueues asynq tasks for multimodal video processing.
+func (s *knowledgeService) enqueueVideoMultimodalTasks(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	kb *types.KnowledgeBase,
+	videoFilePath string,
+	chunks []types.ParsedChunk,
+) {
+	if s.task == nil || videoFilePath == "" {
+		return
+	}
+
+	// Get the first chunk's ID as the parent chunk
+	chunkID := ""
+	if len(chunks) > 0 {
+		chunkID = chunks[0].ChunkID
+	}
+
+	lang, _ := types.LanguageFromContext(ctx)
+	payload := types.VideoMultimodalPayload{
+		TenantID:        knowledge.TenantID,
+		KnowledgeID:     knowledge.ID,
+		KnowledgeBaseID: kb.ID,
+		ChunkID:         chunkID,
+		VideoURL:        videoFilePath,
+		EnableVLM:       true,
+		EnableASR:       true,
+		Language:        lang,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to marshal video multimodal payload: %v", err)
+		return
+	}
+
+	task := asynq.NewTask(types.TypeVideoMultimodal, payloadBytes)
+	if _, err := s.task.Enqueue(task); err != nil {
+		logger.Warnf(ctx, "Failed to enqueue video multimodal task for %s: %v", videoFilePath, err)
+	} else {
+		logger.Infof(ctx, "Enqueued video:multimodal task for %s", videoFilePath)
 	}
 }
 
@@ -9010,6 +9352,7 @@ func (s *knowledgeService) moveKnowledgeReparse(
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              knowledge.ID,
@@ -9020,6 +9363,7 @@ func (s *knowledgeService) moveKnowledgeReparse(
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)

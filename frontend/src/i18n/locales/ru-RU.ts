@@ -85,6 +85,8 @@ export default {
     noValidFilesSelected: 'Все выбранные файлы не поддерживаются',
     hiddenFilesFiltered: 'Отфильтровано {count} скрытых файлов',
     imagesFilteredNoVLM: 'Отфильтровано {count} изображений (VLM не включен)',
+    videosFilteredNoVLM: 'Отфильтровано {count} видеофайлов (VLM не включен)',
+    audiosFilteredNoASR: 'Отфильтровано {count} аудиофайлов (ASR не включен)',
     invalidFilesFiltered: 'Отфильтровано {count} неподдерживаемых файлов',
     unsupportedFileType: 'Неподдерживаемый тип файла',
     unsupportedTypesHint: 'Некоторые типы документов ({types}) не имеют доступного парсера и не могут быть обработаны',
@@ -93,7 +95,7 @@ export default {
     andMoreFiles: '...и ещё {count} файлов',
     duplicateFilesSkipped: 'Пропущено {count} повторяющихся файлов',
     uploadFile: 'Загрузить файл',
-    uploadFileDesc: 'Поддерживает PDF, Word, TXT и т.д.',
+    uploadFileDesc: 'Поддерживает PDF, Word, TXT, изображения, видео, аудио и т.д.',
     importURL: 'Импорт из URL',
     importURLDesc: 'Импорт по ссылке URL',
     importURLTitle: 'Импорт из URL',
@@ -208,6 +210,7 @@ export default {
     parsingFailed: 'Парсинг не удался',
     parsingInProgress: 'Парсинг...',
     generatingSummary: 'Генерация резюме...',
+    documentSummary: 'Резюме',
     deleteConfirmation: 'Подтверждение удаления',
     confirmDeleteDocument: 'Подтвердить удаление документа "{fileName}", после удаления восстановление невозможно',
     cancel: 'Отмена',
@@ -1380,17 +1383,20 @@ export default {
         embedding: 'Настройте модель встраивания для текстовой векторизации',
         rerank: 'Настройте модель для повторного ранжирования результатов',
         vllm: 'Настройте визуально-языковую модель для мультимодального понимания',
+        asr: 'Настройте модель распознавания речи для транскрибации аудио',
         default: 'Настройте информацию о модели'
       },
       modelNamePlaceholder: {
         local: 'например: llama2:latest',
         remote: 'например: gpt-4, claude-3-opus',
         localVllm: 'например: llava:latest',
-        remoteVllm: 'например: gpt-4-vision-preview'
+        remoteVllm: 'например: gpt-4-vision-preview',
+        remoteAsr: 'например: whisper-1'
       },
       baseUrlLabel: 'Base URL',
       baseUrlPlaceholder: 'например: https://api.openai.com/v1',
       baseUrlPlaceholderVllm: 'например: http://localhost:11434/v1',
+      baseUrlPlaceholderAsr: 'например: https://api.openai.com/v1',
       apiKeyOptional: 'API Key (опционально)',
       apiKeyPlaceholder: 'Введите API Key',
       connectionTest: 'Проверка соединения',
@@ -1437,6 +1443,10 @@ export default {
         openai: {
           label: 'OpenAI',
           description: 'gpt-5.2, gpt-5-mini, etc.'
+        },
+        azure_openai: {
+          label: 'Azure OpenAI',
+          description: 'Сервис OpenAI на платформе Microsoft Azure',
         },
         aliyun: {
           label: 'Aliyun DashScope',
@@ -1639,7 +1649,8 @@ export default {
       advanced: 'Дополнительные настройки',
       faq: 'FAQ настройки',
       graph: 'Граф знаний',
-      multimodal: 'Мультимодальность',
+      multimodal: 'Обработка изображений',
+      asr: 'Обработка аудио',
       storage: 'Storage Engine',
       datasource: 'Источники данных',
       share: 'Sharing'
@@ -1834,8 +1845,17 @@ export default {
       childChunkSizeDescription: 'Размер дочерних блоков для поиска по эмбеддингам (64-1024)'
     },
     multimodal: {
-      title: 'Мультимодальная конфигурация',
-      description: 'Настройка понимания мультимодального контента для парсинга и поиска нетекстового содержимого, такого как изображения',
+      title: 'Обработка изображений',
+      description: 'Настройте понимание изображений для парсинга и поиска нетекстового контента',
+    },
+    asr: {
+      title: 'Обработка аудио',
+      description: 'Настройте распознавание речи для загрузки аудиофайлов (mp3, wav, m4a, flac, ogg) и автоматической транскрибации в текст',
+      label: 'Включить распознавание речи',
+      desc: 'При включении аудиофайлы могут быть загружены в базу знаний и автоматически транскрибированы в текст',
+      modelLabel: 'Модель ASR',
+      modelDescription: 'Модель распознавания речи для транскрибации аудио (например, OpenAI Whisper)',
+      modelPlaceholder: 'Выберите модель ASR',
     },
     advanced: {
       title: 'Расширенные настройки',
@@ -2379,6 +2399,11 @@ export default {
       desc: 'Визуально-языковые модели для мультимодального понимания',
       empty: 'Нет VLLM моделей'
     },
+    asr: {
+      title: 'ASR модели речи',
+      desc: 'Модели распознавания речи для транскрибации аудио (например, OpenAI Whisper)',
+      empty: 'Нет ASR моделей'
+    },
     toasts: {
       nameRequired: 'Название модели не может быть пустым',
       nameTooLong: 'Название модели не может превышать 100 символов',
@@ -2663,6 +2688,8 @@ export default {
     unsupportedHint: 'Скачайте файл и откройте локально',
     fullscreen: 'Полноэкранный режим',
     exitFullscreen: 'Выйти из полноэкранного режима',
+    audioLoading: 'Загрузка аудио…',
+    audioNotSupported: 'Ваш браузер не поддерживает воспроизведение аудио',
   },
   knowledgeSearch: {
     title: 'Поиск',
@@ -2748,6 +2775,7 @@ export default {
       fileTypeText: 'Текстовые файлы',
       fileTypeJson: 'Файлы JSON',
       fileTypeImage: 'Изображения',
+      fileTypeAudio: 'Аудиофайлы',
       engines: {
         builtin: {
           name: 'Встроенный',
@@ -3386,6 +3414,7 @@ export default {
     connectionFailed: 'Подключение не удалось',
     isRequired: 'обязательно для заполнения',
     resourceHint: 'Выберите пространства или папки для синхронизации',
+    untitled: 'Без названия',
     resourceLoadFailed: 'Не удалось загрузить список ресурсов',
     noResources: 'Пространства вики не найдены',
     noResourcesHint: 'Сначала сохраните источник данных и проверьте права доступа',
